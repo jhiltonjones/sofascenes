@@ -2,10 +2,19 @@ import Sofa
 import os
 import numpy as np
 
+# THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# MESH_DIR = os.path.join(THIS_DIR, "mesh")
+# carotids_path = os.path.join(MESH_DIR, "carotids.stl")
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 MESH_DIR = os.path.join(THIS_DIR, "mesh")
-carotids_path = os.path.join(MESH_DIR, "carotids.stl")
 
+carotids_path        = os.path.join(MESH_DIR, "carotids.stl")
+aneurysm_collis_path = os.path.join(MESH_DIR, "aneurysm3d_collis.obj")
+aneurysm_surf_path   = os.path.join(MESH_DIR, "aneurysm3d_surface.obj")
+cava_path            = os.path.join(MESH_DIR, "CavaVeinAndHeart.obj")
+key_tip_path         = os.path.join(MESH_DIR, "key_tip.obj")
+phantom_path         = os.path.join(MESH_DIR, "phantom.obj")
 
 def _get_data_float(obj, name):
     """Robustly fetch a SOFA Data field as float, or None."""
@@ -446,6 +455,62 @@ class TipRegionContactForceLogger(Sofa.Core.Controller):
         except Exception as e:
             print(f"[TipRegion] CSV write failed: {e}")
 
+def add_static_mesh(parent, name, filename,
+                    translation=(0,0,0), rotation=(0,0,0), scale=1.0,
+                    visual=True, collision=True,
+                    flipNormals=False, triangulate=True):
+    """
+    Adds a static mesh with optional visual + collision models.
+    - For collision against a catheter, TriangleCollisionModel is typical.
+    - If you only want visuals, set collision=False.
+    """
+    n = parent.addChild(name)
+
+    # Pick loader based on extension
+    ext = filename.split('.')[-1].lower()
+    if ext == "stl":
+        n.addObject('MeshSTLLoader', name='loader', filename=filename,
+                    flipNormals=flipNormals, triangulate=triangulate, rotation=list(rotation))
+        # STL loader output typically provides position + triangles
+        n.addObject('MeshTopology', name='topo',
+                    position='@loader.position',
+                    triangles='@loader.triangles')
+    elif ext == "obj":
+        # MeshOBJLoader provides position + triangles/quads/edges depending on file
+        n.addObject('MeshOBJLoader', name='loader', filename=filename,
+                    flipNormals=flipNormals, triangulate=triangulate, rotation=list(rotation))
+        n.addObject('MeshTopology', name='topo',
+                    position='@loader.position',
+                    triangles='@loader.triangles')
+        # Note: if your OBJ has quads only, triangulate=True is important.
+    else:
+        raise ValueError(f"Unsupported mesh extension: {ext}")
+
+    # Mechanical state (even for static objects)
+    n.addObject('MechanicalObject', name='dofs',
+                translation=list(translation), rotation=list(rotation), scale=scale,
+                showObject=False, showObjectScale=1.0)
+
+    # IMPORTANT: ensure topology follows the MechanicalObject transform
+    # In many scenes this is implicit; if you see transform not applied, add a mapping:
+    # n.addObject('IdentityMapping', input='@dofs', output='@topo')  # only if needed
+
+    if collision:
+        # Static collision object
+        n.addObject('TriangleCollisionModel', name='triColl',
+                    moving=False, simulated=False)
+        n.addObject('LineCollisionModel', name='lineColl',
+                    moving=False, simulated=False)
+        n.addObject('PointCollisionModel', name='ptColl',
+                    moving=False, simulated=False)
+
+    if visual:
+        visu = n.addChild('Visual')
+        visu.addObject('OglModel', name='ogl', src='@../loader', color=[1.0, 1.0, 1.0, 0.2])
+
+        visu.addObject('IdentityMapping')  # maps MechanicalObject to OglModel
+
+    return n
 
 
 
@@ -525,7 +590,7 @@ def createScene(rootNode):
         startingPos=[0,0,0,0,0,0,1],
         xtip=[0],
         printLog=True,
-        rotationInstrument=0,   # or just remove this line
+        rotationInstrument=0,  
         step=5., speed=10.,
         listening=True,
         controlledInstrument=0
@@ -570,11 +635,11 @@ def createScene(rootNode):
     #     plot_path=png_out
     # ))
 
-    print("[DBG] cathLine:", BeamCollis.getObject('cathLine'))
-    print("[DBG] cathPoints:", BeamCollis.getObject('cathPoints'))
+    # print("[DBG] cathLine:", BeamCollis.getObject('cathLine'))
+    # print("[DBG] cathPoints:", BeamCollis.getObject('cathPoints'))
     # print("[DBG] vesselTris:", Carotids.getObject('vesselTris'))
 
-    print("[DBG] cathLine path:", BeamCollis.getObject('cathLine').getPathName())
+    # print("[DBG] cathLine path:", BeamCollis.getObject('cathLine').getPathName())
     # print("[DBG] vesselTris path:", Carotids.getObject('vesselTris').getPathName())
     # --- Catheter tube visualisation (surface) ---
     VisuCath = BeamMechanics.addChild('VisuCatheter')
@@ -616,31 +681,54 @@ def createScene(rootNode):
     VisuOgl.addObject('OglModel', name="CatheterVisual", src='@../TubeQuads', color='white')
     VisuOgl.addObject('IdentityMapping', input='@../Quads', output='@CatheterVisual')
 
-    Carotids = rootNode.addChild('Carotids')
-    Carotids.addObject('MeshSTLLoader', filename=carotids_path, flipNormals=False, triangulate=True,
-                    name='meshLoader', rotation=[10.0, 0.0, -90.0])
-    Carotids.addObject('MeshTopology', position='@meshLoader.position', triangles='@meshLoader.triangles')
-    Carotids.addObject('MechanicalObject', position=[0,0,400], scale=3, name='DOFs1', ry=90)
-    Carotids.addObject('LineCollisionModel', name='vesselLines', moving=False, simulated=False)
-    Carotids.addObject('TriangleCollisionModel', name='vesselTris', moving=False, simulated=False)
-    print("[DBG] vesselTris:", Carotids.getObject('vesselTris'), flush=True)
-    print("[DBG] vesselTris path:", Carotids.getObject('vesselTris').getPathName(), flush=True)
+    # Carotids = rootNode.addChild('Carotids')
+    # Carotids.addObject('MeshSTLLoader', filename=carotids_path, flipNormals=False, triangulate=True,
+    #                 name='meshLoader', rotation=[10.0, 0.0, -90.0])
+    # Carotids.addObject('MeshTopology', position='@meshLoader.position', triangles='@meshLoader.triangles')
+    # Carotids.addObject('MechanicalObject', position=[0,0,400], scale=3, name='DOFs1', ry=90)
+    # Carotids.addObject('LineCollisionModel', name='vesselLines', moving=False, simulated=False)
+    # Carotids.addObject('TriangleCollisionModel', name='vesselTris', moving=False, simulated=False)
+    # print("[DBG] vesselTris:", Carotids.getObject('vesselTris'), flush=True)
+    # print("[DBG] vesselTris path:", Carotids.getObject('vesselTris').getPathName(), flush=True)
 
         # --- create ContactListener NOW ---
+    # cath_points = BeamCollis.getObject('cathPoints')
+
+
+    # # Carotids (you already have this; shown here in the unified style)
+    # carotids = add_static_mesh(
+    #     rootNode, "Carotids",
+    #     carotids_path,
+    #     translation=(0,0,0),
+    #     rotation=(0, 0, 0),
+    #     scale=3.0,
+    #     visual=True,
+    #     collision=True,
+    #     triangulate=True
+    # )
+    # # Example: listen against Carotids triangle collision model
+    # vessel_tris = carotids.getObject('triColl')
+# --- Carotids ---
+    aneurysm_coll = add_static_mesh(
+        rootNode, "AneurysmCollis",
+        aneurysm_collis_path,
+        translation=(0,0,400),
+        rotation=(10, 0, -90),
+        scale=3.0,
+        visual=False,
+        collision=True,
+        triangulate=True
+    )
+    print("[DBG] catheter DOFs first:", BeamMechanics.getObject('DOFs').position[0], flush=True)
+    print("[DBG] vessel triColl path:", vessel_tris.getPathName(), flush=True)
+    print("[DBG] carotids dofs:", aneurysm_coll.getObject('dofs').translation.value, aneurysm_coll.getObject('dofs').rotation.value, flush=True)
+
+    # --- ContactListener (ONLY ONCE) ---
     cath_points = BeamCollis.getObject('cathPoints')
-    vessel_tris  = Carotids.getObject('vesselTris')
+    vessel_tris = aneurysm_coll.getObject('triColl')
 
-    print("[DBG] cathPoints path:", cath_points.getPathName(), flush=True)
-    print("[DBG] vesselTris path:", vessel_tris.getPathName(), flush=True)
-
-    cath_points = BeamCollis.getObject('cathPoints')
-    vessel_tris  = Carotids.getObject('vesselTris')
-
-    cm1 = '@' + cath_points.getPathName()   # -> "@/BeamModel/CollisionModel/cathPoints"
-    cm2 = '@' + vessel_tris.getPathName()   # -> "@/Carotids/vesselTris"
-
-    print("[DBG] ContactListener cm1:", cm1)
-    print("[DBG] ContactListener cm2:", cm2)
+    cm1 = '@' + cath_points.getPathName()
+    cm2 = '@' + vessel_tris.getPathName()
 
     contact_listener = rootNode.addObject(
         'ContactListener',
@@ -648,8 +736,8 @@ def createScene(rootNode):
         collisionModel1=cm1,
         collisionModel2=cm2,
         listening=True
-        )
-    print("[DBG] listener:", contact_listener.getPathName())
+    )
+
 
 
     BeamCollis.addObject(TipRegionContactForceLogger(
