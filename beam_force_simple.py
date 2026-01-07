@@ -636,7 +636,9 @@ def createScene(rootNode):
     rootNode.addObject('RequiredPlugin', pluginName='Sofa.Component.Topology.Mapping Sofa.Component.Mapping.Linear Sofa.GL.Component.Rendering3D')
 
     rootNode.addObject("VisualStyle", displayFlags="showVisualModels hideBehaviorModels showCollisionModels")
-    rootNode.findData("bbox").value = "-200 -200 -200 200 200 600"
+    rootNode.findData("bbox").value = "-100 -100 -50 100 100 500"
+
+
 
     rootNode.addObject('FreeMotionAnimationLoop')
     rootNode.addObject('DefaultVisualManagerLoop')
@@ -645,6 +647,7 @@ def createScene(rootNode):
                        name='GCS',
                        maxIt=1000, tolerance=1e-6,
                        computeConstraintForces=True)
+
 
     catheter_radius = 2
     catheter_E = 2000
@@ -659,6 +662,9 @@ def createScene(rootNode):
                        name='localmindistance',
                        angleCone='0.2')
     rootNode.addObject('CollisionResponse', name='Response', response='FrictionContactConstraint')
+
+
+
 
     topoLines = rootNode.addChild('EdgeTopology')
 
@@ -763,7 +769,7 @@ def createScene(rootNode):
         rootNode, "CalibrationBox",
         size_x=50.0, size_y=50.0, thickness=5.0,   # make it thick
         translation=(0, 0, 10),
-        rotation=(-50, 0, 45),
+        rotation=(0, 0, 0),
         collision=True,
         visual=True
     )
