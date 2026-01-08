@@ -13,6 +13,9 @@ cava_path            = os.path.join(MESH_DIR, "CavaVeinAndHeart.obj")
 key_tip_path         = os.path.join(MESH_DIR, "key_tip.obj")
 phantom_path         = os.path.join(MESH_DIR, "phantom.obj")
 
+import Sofa
+import numpy as np
+
 class ContactTipCircLogger(Sofa.Core.Controller):
     def __init__(self,
                  contact_listener,
@@ -22,9 +25,7 @@ class ContactTipCircLogger(Sofa.Core.Controller):
                  gate=np.inf,
                  r_perp_min=1e-5,
                  show_p1=True,
-                 marker_mo=None,  
-                 tip_window_pts=5, 
-                 tip_max_dist=None,        # optional marker MechanicalObject to move to p_circ
+                 marker_mo=None,          # optional marker MechanicalObject to move to p_circ
                  **kwargs):
         super().__init__(**kwargs)
         self.cl = contact_listener
@@ -36,8 +37,16 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         self.show_p1 = bool(show_p1)
         self.marker_mo = marker_mo
         self.step = 0
-        self.tip_window_pts = int(tip_window_pts)
-        self.tip_max_dist = None if tip_max_dist is None else float(tip_max_dist)
+        self.prev_t_hat = None
+        self.prev_e1 = None
+        self.prev_r_hat = None
+        self.csv_path = "/home/jack/sofascenes/contact_angle5.csv"
+        self._csv_initialized = False
+        self.prev_theta = None
+        self.theta_unwrapped = None
+
+
+
 
     def _v3(self, v):
         if v is None:
@@ -56,25 +65,56 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         return None if n < eps else (v / n)
 
     def _compute_tip_frame(self, pos):
-        # pos is (N,3) collision positions
         if pos.shape[0] < 2:
             return None
         p_tip = pos[-1]
         p_prev = pos[-2]
+
         t_hat = self._unit(p_tip - p_prev)
         if t_hat is None:
             return None
 
-        # choose an "up" that is not parallel to t_hat
-        up = np.array([0.0, 0.0, 1.0], dtype=float)
-        if abs(float(np.dot(up, t_hat))) > 0.95:
-            up = np.array([0.0, 1.0, 0.0], dtype=float)
+        # --- Continuity: keep t_hat direction consistent across time ---
+        if self.prev_t_hat is not None and float(np.dot(t_hat, self.prev_t_hat)) < 0.0:
+            t_hat = -t_hat  # flip tangent to maintain continuity
 
-        e1 = self._unit(np.cross(t_hat, up))
+        # --- Choose a stable reference axis for building e1 ---
+        # Use previous e1 if available; otherwise pick a world axis not parallel to t_hat
+        if self.prev_e1 is not None:
+            # make e1 the previous e1 projected onto the plane normal to t_hat
+            e1 = self.prev_e1 - np.dot(self.prev_e1, t_hat) * t_hat
+            e1 = self._unit(e1)
+            if e1 is None:
+                self.prev_e1 = None  # fallback below
+        else:
+            e1 = None
+
         if e1 is None:
-            return None
+            # fallback: pick a world axis that is least aligned with t_hat
+            cand_axes = [
+                np.array([1.0, 0.0, 0.0], dtype=float),
+                np.array([0.0, 1.0, 0.0], dtype=float),
+                np.array([0.0, 0.0, 1.0], dtype=float),
+            ]
+            dots = [abs(float(np.dot(a, t_hat))) for a in cand_axes]
+            ref = cand_axes[int(np.argmin(dots))]  # least aligned axis
+            e1 = self._unit(np.cross(t_hat, ref))
+            if e1 is None:
+                return None
+
         e2 = np.cross(t_hat, e1)
+
+        # --- Continuity: prevent e1 from flipping sign (keeps theta stable) ---
+        if self.prev_e1 is not None and float(np.dot(e1, self.prev_e1)) < 0.0:
+            e1 = -e1
+            e2 = -e2
+
+        # store for next step
+        self.prev_t_hat = t_hat
+        self.prev_e1 = e1
+
         return p_tip, t_hat, e1, e2
+
 
     def _parse_contact_item(self, item):
         id1 = id2 = None
@@ -113,13 +153,17 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             return None, None, None
 
         r_hat = v_perp / n
-        p_circ = p_tip + self.R * r_hat
 
-        # circumferential angle
+
+
+        p_circ = p_tip + self.R * r_hat
         c1 = float(np.dot(r_hat, e1))
         c2 = float(np.dot(r_hat, e2))
         theta = float(np.arctan2(c2, c1))
+        if theta < 0:
+            theta += 2.0*np.pi
         return p_circ, r_hat, theta
+
 
     def onAnimateEndEvent(self, event):
         self.step += 1
@@ -174,7 +218,6 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         # decide which point is catheter-side by distance to p_tip
         d1 = float(np.linalg.norm(p1 - p_tip))
         d2 = float(np.linalg.norm(p2 - p_tip))
-
         if d1 <= d2:
             p_cath, p_env = p1, p2
             id_cath, id_env = id1, id2
@@ -186,20 +229,76 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             d_cath, d_env = d2, d1
             cath_label = "p2"
 
-        # --- TIP-ONLY ACCEPTANCE GATE ---
-        tip_ok_dist = True
-        if self.tip_max_dist is not None:
-            tip_ok_dist = (d_cath <= self.tip_max_dist)
-
-        K = max(1, min(self.tip_window_pts, pos.shape[0]))
-        tip_block = pos[-K:, :]
-        dmin_tipblock = float(np.min(np.linalg.norm(tip_block - p_cath[None, :], axis=1)))
-
-        # Tolerance for "belongs to tip region"
-        tip_ok_window = (dmin_tipblock <= 1e-3)
-
-        if not (tip_ok_dist and tip_ok_window):
+        p_circ, r_hat, theta = self._tip_circumference_point(p_tip, t_hat, e1, e2, p_cath, p_env=p_env)
+        if theta is None:
             return
+        def _wrap_pi(a):
+            return (a + np.pi) % (2*np.pi) - np.pi
+
+        # after theta computed
+        if self.prev_theta is not None:
+            theta_alt = (theta + np.pi) % (2*np.pi)   # corresponds to flipping r_hat
+            d0 = abs(_wrap_pi(theta - self.prev_theta))
+            d1 = abs(_wrap_pi(theta_alt - self.prev_theta))
+            if d1 < d0:
+                theta = theta_alt
+                r_hat = -r_hat
+                p_circ = p_tip + self.R * r_hat
+
+        t = float(self.getContext().time.value)
+
+        # continuity on r_hat to prevent pi-jumps
+        if self.prev_r_hat is not None and float(np.dot(r_hat, self.prev_r_hat)) < 0.0:
+            r_hat = -r_hat
+        self.prev_r_hat = r_hat
+
+
+        # primary log
+        if p_circ is not None:
+            print(f"[TipCirc] t={t:.6f} nC={nC} idx={idx} gap={gap:.3e} "
+                  f"cath={cath_label} id_cath={id_cath} d_cath={d_cath:.3e} "
+                  f"p_cath={np.array2string(p_cath, precision=6)} "
+                  f"p_circ={np.array2string(p_circ, precision=6)} "
+                  f"theta(rad)={theta:.6f}")
+        else:
+            print(f"[TipCirc] t={t:.6f} nC={nC} idx={idx} gap={gap:.3e} "
+                  f"cath={cath_label} id_cath={id_cath} d_cath={d_cath:.3e} "
+                  f"p_cath={np.array2string(p_cath, precision=6)} "
+                  f"(no circumference point: radial ill-conditioned)")
+
+        # optional secondary log
+        if self.show_p1:
+            print(f"         p1 id1={id1} d(p1,tip)={d1:.3e} p1={np.array2string(p1, precision=6)}")
+            print(f"         p2 id2={id2} d(p2,tip)={d2:.3e} p2={np.array2string(p2, precision=6)}")
+        if self.step % 50 == 0 and p_circ is not None:
+            v = p_circ - p_tip
+            print("check |v|=", np.linalg.norm(v), " axial=", abs(np.dot(v, t_hat)))
+
+        # move marker to circumference point (more useful than p2)
+        if self.marker_mo is not None and p_circ is not None:
+            try:
+                self.marker_mo.position.value = [p_circ.tolist()]
+            except Exception:
+                pass
+        if not self._csv_initialized:
+            with open(self.csv_path, "w") as f:
+                f.write("t,theta_wrapped,theta_unwrapped,gap,d_cath\n")
+            self._csv_initialized = True
+
+        # incremental unwrap (or omit and unwrap in post)
+        if self.prev_theta is None:
+            self.theta_unwrapped = theta
+        else:
+            d = theta - self.prev_theta
+            d = (d + np.pi) % (2*np.pi) - np.pi
+            self.theta_unwrapped += d
+        self.prev_theta = theta
+
+        with open(self.csv_path, "a") as f:
+            f.write(f"{t:.6f},{theta:.10f},{self.theta_unwrapped:.10f},{gap:.6e},{d_cath:.6e}\n")
+
+
+
 
 
 class TipContactForceAndPointRobust(Sofa.Core.Controller):
@@ -495,6 +594,7 @@ class TipContactForceAndPointRobust(Sofa.Core.Controller):
                 self.marker_mo.position.value = [p_circ.tolist()]
             except Exception:
                 pass
+            
 
 
 
@@ -712,7 +812,7 @@ def createScene(rootNode):
         rootNode, "CalibrationBox",
         size_x=100.0 * MM, size_y=100.0 * MM, thickness=5.0 * MM,
         translation=(0.0, 0.0, 25.0 * MM),
-        rotation=(30, 0, 0),
+        rotation=(-20, 0, 75),
         collision=True,
         visual=True
     )
@@ -759,16 +859,14 @@ def createScene(rootNode):
 
 
     BeamCollis.addObject(ContactTipCircLogger(
-        name="TipCircLogger",
         contact_listener=contact_listener,
         collision_mo=collision_mo,
         R=catheter_radius,
         every=1,
         gate=1e-3,
-        tip_window_pts=10,
-        tip_max_dist=catheter_radius,   # or None while debugging
         show_p1=True
     ))
+
 
 
 
