@@ -277,301 +277,127 @@ class ContactTipCircLogger(Sofa.Core.Controller):
 
 
 
+import os
+import numpy as np
+import Sofa
 
-class TipContactForceAndPointRobust(Sofa.Core.Controller):
-    def __init__(self,
-                 collision_mo,
-                 constraint_solver,
-                 contact_listener=None,
-                 tip_radius=2.0,
-                 tip_window=10,
-                 sample_every=10,
-                 eps=1e-12,
-                 gap_contact_gate=1e-3,   # m
-                 r_perp_min=5e-6,         # m
-                 force_min=1e-6,
-                 debug_shapes_every=50,
-                 **kwargs):
+class CurvatureTorsionLogger(Sofa.Core.Controller):
+    def __init__(self, dofs_mo, every=1, csv_path="curv_tau.csv", **kwargs):
         super().__init__(**kwargs)
-        self.collision_mo = collision_mo
-        self.solver = constraint_solver
-        self.cl = contact_listener
-
-        self.tip_radius = float(tip_radius)
-        self.tip_window = int(tip_window)
-        self.sample_every = int(sample_every)
-        self.eps = float(eps)
-
-        self.gap_contact_gate = float(gap_contact_gate)
-        self.r_perp_min = float(r_perp_min)
-        self.force_min = float(force_min)
-
-        self.debug_shapes_every = int(debug_shapes_every)
-
+        self.dofs = dofs_mo
+        self.every = int(every)
+        self.csv_path = str(csv_path)
         self.step = 0
-        self._dumped = False
-        self._coord_dumped = False
 
-    def _unit(self, v):
-        n = float(np.linalg.norm(v))
-        return None if n < self.eps else (v / n)
+        # Create file immediately (so you can confirm path/permissions)
+        out_dir = os.path.dirname(self.csv_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
-    def _wrap_deg(self, a):
-        a = float(a) % 360.0
-        return a + 360.0 if a < 0 else a
+        with open(self.csv_path, "w") as f:
+            f.write("t,s,kappa,tau\n")
 
-    def _v3_to_np(self, v):
-        if v is None:
-            return None
-        try:
-            return np.array([float(v[0]), float(v[1]), float(v[2])], dtype=float)
-        except Exception:
-            pass
-        try:
-            return np.array([float(v.x), float(v.y), float(v.z)], dtype=float)
-        except Exception:
-            pass
-        try:
-            a = np.asarray(v, dtype=float).ravel()
-            return a[:3].astype(float) if a.size >= 3 else None
-        except Exception:
-            return None
+        print(f"[CurvTau] logging to: {self.csv_path}")
 
-    def _compute_tip_frame(self, pos):
-        if pos.shape[0] < 2:
-            return None
-        p_tip = pos[-1]
-        p_prev = pos[-2]
-        t_hat = self._unit(p_tip - p_prev)
-        if t_hat is None:
-            return None
+    @staticmethod
+    def _arc_length(P):
+        d = np.linalg.norm(P[1:] - P[:-1], axis=1)
+        s = np.zeros(P.shape[0], dtype=float)
+        s[1:] = np.cumsum(d)
+        return s
 
-        up = np.array([0.0, 0.0, 1.0], dtype=float)
-        if abs(float(np.dot(up, t_hat))) > 0.95:
-            up = np.array([0.0, 1.0, 0.0], dtype=float)
+    @staticmethod
+    def _curvature_3pt(P, eps=1e-12):
+        N = P.shape[0]
+        kappa = np.full(N, np.nan, dtype=float)
+        for i in range(1, N - 1):
+            a = P[i]   - P[i - 1]
+            b = P[i+1] - P[i]
+            la = np.linalg.norm(a)
+            lb = np.linalg.norm(b)
+            c = P[i+1] - P[i-1]
+            lc = np.linalg.norm(c)
+            if la < eps or lb < eps or lc < eps:
+                continue
+            area2 = np.linalg.norm(np.cross(a, b))  # 2*Area
+            if area2 < eps:
+                kappa[i] = 0.0
+                continue
+            kappa[i] = (2.0 * area2) / (la * lb * lc)
+        return kappa
 
-        e1 = self._unit(np.cross(t_hat, up))
-        if e1 is None:
-            return None
-        e2 = np.cross(t_hat, e1)
-        return p_tip, t_hat, e1, e2
+    @staticmethod
+    def _torsion_dihedral(P, s, eps=1e-12):
+        N = P.shape[0]
+        tau = np.full(N, np.nan, dtype=float)
 
-    def _all_point_forces_from_constraints(self, dt):
+        for i in range(1, N - 2):
+            p0, p1, p2, p3 = P[i-1], P[i], P[i+1], P[i+2]
+            b1 = p1 - p0
+            b2 = p2 - p1
+            b3 = p3 - p2
+
+            n1 = np.cross(b1, b2)
+            n2 = np.cross(b2, b3)
+
+            n1n = np.linalg.norm(n1)
+            n2n = np.linalg.norm(n2)
+            b2n = np.linalg.norm(b2)
+            if n1n < eps or n2n < eps or b2n < eps:
+                continue
+
+            n1u = n1 / n1n
+            n2u = n2 / n2n
+            t2  = b2 / b2n
+
+            x = np.dot(n1u, n2u)
+            y = np.dot(t2, np.cross(n1u, n2u))
+            angle = np.arctan2(y, x)
+
+            ds = s[i+1] - s[i]
+            if ds < eps:
+                continue
+
+            tau[i+1] = angle / ds
+        return tau
+
+    def _get_positions(self):
         """
-        WARNING: This is NOT guaranteed to be contact-only.
-        It is a 'reaction-like' force reconstructed from the constraints
-        seen by the solver and the constraint matrix attached to collision_mo.
+        Works with Rigid3d: position is [x,y,z,qx,qy,qz,qw].
         """
-        pos = np.asarray(self.collision_mo.position.value, dtype=float)
-        npts = pos.shape[0]
-        if npts == 0:
-            return None, None, None
+        raw = self.dofs.position.value
 
-        J = self.collision_mo.constraint.value
-        if J is None or getattr(J, "shape", (0, 0))[0] == 0:
-            return None, J, None
-
-        lambdas = np.asarray(self.solver.constraintForces.value, dtype=float).ravel()
-        if lambdas.size == 0:
-            return None, J, lambdas
-
-        m = min(J.shape[0], lambdas.size)
-        if m <= 0:
-            return None, J, lambdas
-
-        f = (J[:m, :].T @ lambdas[:m]) / dt
-        if f.size < 3 * npts:
-            return None, J, lambdas
-
-        return f[:3 * npts].reshape((npts, 3)), J, lambdas
-
-    # --- Add these helpers inside your class ---
-
-    def _fmtv(self, v, prec=6):
-        return np.array2string(np.asarray(v, dtype=float), precision=prec, suppress_small=False)
-
-    def _closest_contact_gap_p2(self):
-        cl = self.cl
-        if cl is None:
-            return (np.nan, None, None, None, None, 0)
-
+        # raw might be list-like of size N, each element length 7
         try:
-            nC = int(cl.getNumberOfContacts())
+            X = np.asarray(raw, dtype=float)
         except Exception:
-            return (np.nan, None, None, None, None, 0)
+            # fallback: build manually
+            X = np.array([list(r) for r in raw], dtype=float)
 
-        if nC <= 0:
-            return (np.nan, None, None, None, None, 0)
-
-        gap = np.nan
-        idx = 0
-        dists = None
-        try:
-            dists = np.asarray(cl.getDistances(), dtype=float).ravel()
-            if dists.size > 0 and np.any(np.isfinite(dists)):
-                idx = int(np.nanargmin(dists))
-                gap = float(dists[idx])
-        except Exception:
-            pass
-
-        try:
-            cps = cl.getContactPoints()
-        except Exception:
-            cps = None
-
-        if cps is None or idx >= len(cps):
-            return (gap, None, None, None, None, nC)
-
-        item = cps[idx]
-
-        if not self._dumped:
-            self._dumped = True
-            print("========== CONTACT_DUMP (one-time) ==========")
-            print("[listener]", cl.getPathName())
-            print("[nC]", nC)
-            print("[len(distances)]", len(dists) if dists is not None else "NA")
-            print("[type(item)]", type(item), " len=", len(item) if hasattr(item, "__len__") else "NA")
-            print("[repr(item)]", repr(item))
-
-        # Expected format: (id1, p1, id2, p2)
-        id1 = None
-        id2 = None
-        p1 = None
-        p2 = None
-
-        if isinstance(item, (list, tuple)) and len(item) >= 4:
-            try:
-                id1 = int(item[0])
-            except Exception:
-                id1 = None
-            p1 = self._v3_to_np(item[1])
-
-            try:
-                id2 = int(item[2])
-            except Exception:
-                id2 = None
-            p2 = self._v3_to_np(item[3])
-        elif isinstance(item, (list, tuple)) and len(item) >= 3:
-            # Fallback format (older/other builds)
-            try:
-                id1 = int(item[0])
-            except Exception:
-                id1 = None
-            p1 = self._v3_to_np(item[1])
-            p2 = self._v3_to_np(item[2])
-
-        return (gap, id1, p1, id2, p2, nC)
-
+        if X.ndim != 2 or X.shape[1] < 3:
+            return None
+        return X[:, :3]
 
     def onAnimateEndEvent(self, event):
         self.step += 1
         if self.every > 1 and (self.step % self.every != 0):
             return
 
-        # breadcrumb every 200 steps
-        if self.step % 200 == 0:
-            print(f"[TipCirc] alive step={self.step}")
-
-        if self.cl is None or self.collision_mo is None:
-            if self.step % 200 == 0:
-                print("[TipCirc] missing cl or collision_mo")
+        P = self._get_positions()
+        if P is None or P.shape[0] < 4:
             return
 
-        try:
-            nC = int(self.cl.getNumberOfContacts())
-        except Exception as e:
-            if self.step % 200 == 0:
-                print("[TipCirc] getNumberOfContacts failed:", e)
-            return
-
-        if nC <= 0:
-            if self.step % 200 == 0:
-                print("[TipCirc] nC=0")
-            return
-
-        try:
-            pos = np.asarray(self.collision_mo.position.value, dtype=float)
-        except Exception as e:
-            if self.step % 200 == 0:
-                print("[TipCirc] collision_mo.position read failed:", e)
-            return
-
-        frame = self._compute_tip_frame(pos)
-        if frame is None:
-            if self.step % 200 == 0:
-                print("[TipCirc] tip frame None (need >=2 points, nonzero tangent)")
-            return
-        p_tip, t_hat, e1, e2 = frame
-
-        try:
-            dists = np.asarray(self.cl.getDistances(), dtype=float).ravel()
-        except Exception:
-            dists = None
-        try:
-            cps = self.cl.getContactPoints()
-        except Exception:
-            cps = None
-        if cps is None or len(cps) == 0:
-            if self.step % 200 == 0:
-                print("[TipCirc] cps empty")
-            return
-
-        idx = 0
-        gap = np.nan
-        if dists is not None and dists.size == len(cps) and np.any(np.isfinite(dists)):
-            idx = int(np.nanargmin(dists))
-            gap = float(dists[idx])
-
-        if np.isfinite(gap) and gap > self.gate:
-            if self.step % 50 == 0:
-                print(f"[TipCirc] gated by gap: gap={gap:.3e} > gate={self.gate:.3e}")
-            return
-
-        id1, p1, id2, p2 = self._parse_contact_item(cps[idx])
-        if p1 is None or p2 is None:
-            if self.step % 200 == 0:
-                print("[TipCirc] parsed p1/p2 None")
-            return
-
-        d1 = float(np.linalg.norm(p1 - p_tip))
-        d2 = float(np.linalg.norm(p2 - p_tip))
-
-        if d1 <= d2:
-            p_cath, p_env = p1, p2
-            id_cath, d_cath, cath_label = id1, d1, "p1"
-        else:
-            p_cath, p_env = p2, p1
-            id_cath, d_cath, cath_label = id2, d2, "p2"
-
-        # --- TIP-ONLY ACCEPTANCE GATE ---
-        tip_ok_dist = True
-        if self.tip_max_dist is not None:
-            tip_ok_dist = (d_cath <= self.tip_max_dist)
-
-        K = max(1, min(self.tip_window_pts, pos.shape[0]))
-        tip_block = pos[-K:, :]
-        dmin_tipblock = float(np.min(np.linalg.norm(tip_block - p_cath[None, :], axis=1)))
-        tip_ok_window = (dmin_tipblock <= 1e-3)
-
-        if not (tip_ok_dist and tip_ok_window):
-            if self.step % 50 == 0:
-                print(f"[TipCirc] rejected: cath={cath_label} d_cath={d_cath:.3e} "
-                    f"tip_ok_dist={tip_ok_dist} tip_ok_window={tip_ok_window} "
-                    f"dmin_tipblock={dmin_tipblock:.3e}")
-            return
-
-        # compute circumference + print
-        p_circ, r_hat, theta = self._tip_circumference_point(p_tip, t_hat, e1, e2, p_cath, p_env=p_env)
         t = float(self.getContext().time.value)
 
-        print(f"[TipCirc] t={t:.6f} nC={nC} gap={gap:.3e} cath={cath_label} id_cath={id_cath} "
-            f"d_cath={d_cath:.3e} theta={None if theta is None else f'{theta:.6f}'}")
-        if p_circ is not None and self.marker_mo is not None:
-            try:
-                self.marker_mo.position.value = [p_circ.tolist()]
-            except Exception:
-                pass
-            
+        s = self._arc_length(P)
+        kappa = self._curvature_3pt(P)
+        tau = self._torsion_dihedral(P, s)
+
+        with open(self.csv_path, "a") as f:
+            for i in range(P.shape[0]):
+                kv = "nan" if np.isnan(kappa[i]) else f"{kappa[i]:.10g}"
+                tv = "nan" if np.isnan(tau[i])   else f"{tau[i]:.10g}"
+                f.write(f"{t:.6f},{s[i]:.10g},{kv},{tv}\n")
 
 
 
@@ -699,7 +525,6 @@ def createScene(rootNode):
     rootNode.addObject('RequiredPlugin', pluginName='Sofa.Component.Topology.Mapping Sofa.Component.Mapping.Linear Sofa.GL.Component.Rendering3D')
     # rootNode.dt = 0.005   # 5 ms
     rootNode.addObject("VisualStyle", displayFlags="showVisualModels hideBehaviorModels showCollisionModels")
-    # rootNode.findData("bbox").value = [-100, -100, -50, 100, 100, 500]
 
 
     rootNode.findData('dt').value = 0.005
@@ -719,8 +544,8 @@ def createScene(rootNode):
     MM = 1
     # --- Catheter material (SI) ---
     catheter_radius = 2.0 * MM          # 2 mm -> 0.002 m
-    catheter_E      = 2000e6            # 2000 MPa -> 2e9 Pa
-    catheter_rho    = 1.1e-6 * 1e9      # kg/mm^3 -> kg/m^3 => 1100 kg/m^3
+    catheter_E   = 2.0e6              # 2e9 Pa -> 2e6 kg/(mm*s^2)
+    catheter_rho = 1.1e-6             # 1100 kg/m^3 -> 1.1e-6 kg/mm^3
 
     # --- Catheter geometry (SI) ---
     catheter_length = 980.0 * MM        # 980 mm -> 0.98 m
@@ -771,11 +596,14 @@ def createScene(rootNode):
 
     BeamMechanics.addObject('AdaptiveBeamForceFieldAndMass', name='BeamForceField',
                             massDensity=catheter_rho, interpolation='@BeamInterpolation')
-    beamFF = BeamMechanics.getObject('BeamForceField')
-    interp = BeamMechanics.getObject('BeamInterpolation')
+    dofs_mo = BeamMechanics.getObject('DOFs')
 
-    print("BeamForceField data:", [d for d in dir(beamFF) if "strain" in d.lower() or "curv" in d.lower() or "tors" in d.lower()])
-    print("Interpolation data:", [d for d in dir(interp) if "strain" in d.lower() or "curv" in d.lower() or "tors" in d.lower()])
+    BeamMechanics.addObject(CurvatureTorsionLogger(
+        dofs_mo=dofs_mo,
+        every=1,
+        csv_path="/home/jack/sofascenes/curv_tau.csv"
+    ))
+
 
     BeamMechanics.addObject(
         'InterventionalRadiologyController',
@@ -783,7 +611,7 @@ def createScene(rootNode):
         template='Rigid3d',
         instruments='BeamInterpolation',
         topology='@MeshLines',
-        startingPos=[1, 1, 0, 0, 0, 0, 1.0],
+        startingPos=[0, 0, 0, 0, 0, 0, 1.0],
         xtip=[0],
         printLog=True,
         rotationInstrument=0,
@@ -847,32 +675,29 @@ def createScene(rootNode):
     VisuOgl.addObject('OglModel', name="CatheterVisual", src='@../TubeQuads', color='white')
     VisuOgl.addObject('IdentityMapping', input='@../Quads', output='@CatheterVisual')
 
-    # box = add_static_box_rigid(
-    #     rootNode, "CalibrationBox",
-    #     size_x=100.0 * MM, size_y=100.0 * MM, thickness=5.0 * MM,
-    #     translation=(0.0, 0.0, 25.0 * MM),
-    #     rotation=(40, 0, 50),
-    #     collision=True,
-    #     visual=True
-    # )
-
-
-    # vessel_tris = box.getChild('Geo').getObject('triColl')
-    carotids = add_static_mesh(
-        rootNode, "Carotids",
-        carotids_path,
-        translation=(15*MM, 0, 0),
-        rotation=(-20, 90, -90),
-        scale=3.0*MM,
-        visual=True,
-        collision=True,     
-        triangulate=True
+    box = add_static_box_rigid(
+        rootNode, "CalibrationBox",
+        size_x=100.0 * MM, size_y=100.0 * MM, thickness=5.0 * MM,
+        translation=(0.0, 0.0, 25.0 * MM),
+        rotation=(50, 0, 100),
+        collision=True,
+        visual=True
     )
 
+
+    vessel_tris = box.getChild('Geo').getObject('triColl')
+    # carotids = add_static_mesh(
+    #     rootNode, "Carotids",
+    #     carotids_path,
+    #     translation=(-1*MM, 4, 0),
+    #     rotation=(30, -90, 90),
+    #     scale=3.0*MM,
+    #     visual=True,
+    #     collision=True,     
+    #     triangulate=True
+    # )
+    # vessel_tris = carotids.getObject('triColl')
     cath_points = BeamCollis.getObject('cathPoints')
-    vessel_tris = carotids.getObject('triColl')
-
-
 
 
     # cath_points = BeamCollis.getObject('cathPoints')
