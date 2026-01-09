@@ -14,7 +14,7 @@ ax = fig.add_subplot(111, projection="polar")
 sc = ax.scatter([], [], s=5)
 ax.set_title("Contact angle around circumference (radius = time)")
 ax.set_rlabel_position(135)
-ax.set_theta_zero_location("S")   # 0° at the right (East)  -> bottom will be 270°
+ax.set_theta_zero_location("N")   # 0° at the right (East)  -> bottom will be 270°
 ax.set_theta_direction(-1)         # counter-clockwise (default)
 
 

@@ -15,54 +15,40 @@ cava_path            = os.path.join(MESH_DIR, "CavaVeinAndHeart.obj")
 key_tip_path         = os.path.join(MESH_DIR, "key_tip.obj")
 phantom_path         = os.path.join(MESH_DIR, "phantom.obj")
 
-import Sofa
 import numpy as np
+import os
+import Sofa
 
 class ContactTipCircLogger(Sofa.Core.Controller):
-    def __init__(self,
-                 contact_listener,
-                 collision_mo,            # REQUIRED: catheter collision MechanicalObject (Vec3d)
-                 R=catheter_radius,                 
-                 every=1,
-                 gate=np.inf,
-                 r_perp_min=1e-5,
-                 show_p1=True,
-                 marker_mo=None,
-                 tip_window=1,          # optional marker MechanicalObject to move to p_circ
-                 **kwargs):
+    def __init__(self, contact_listener, collision_mo, R,
+                 every=1, gate=np.inf, tip_window=2.0,
+                 r_perp_min=1e-5, **kwargs):
         super().__init__(**kwargs)
         self.cl = contact_listener
         self.collision_mo = collision_mo
-        self.R = float(R)
+        self.R = float(R)                 # in your scene units (mm)
         self.every = int(every)
-        self.gate = float(gate)
+        self.gate = float(gate)           # gate in mm (surface gap)
+        self.tip_window = float(tip_window)
         self.r_perp_min = float(r_perp_min)
-        self.show_p1 = bool(show_p1)
-        self.marker_mo = marker_mo
+
         self.step = 0
         self.prev_t_hat = None
         self.prev_e1 = None
-        self.prev_r_hat = None
-        self.csv_path = "/home/jack/sofascenes/contact_angle5.csv"
-        self._csv_initialized = False
         self.prev_theta = None
         self.theta_unwrapped = None
-        self.tip_window = float(tip_window)
 
-
-
+        self.csv_path = "/home/jack/sofascenes/tip_contacts_all.csv"
+        self._csv_initialized = False
 
     def _v3(self, v):
-        if v is None:
-            return None
         try:
             return np.array([float(v[0]), float(v[1]), float(v[2])], dtype=float)
         except Exception:
-            pass
-        try:
-            return np.array([float(v.x), float(v.y), float(v.z)], dtype=float)
-        except Exception:
-            return None
+            try:
+                return np.array([float(v.x), float(v.y), float(v.z)], dtype=float)
+            except Exception:
+                return None
 
     def _unit(self, v, eps=1e-12):
         n = float(np.linalg.norm(v))
@@ -78,53 +64,44 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         if t_hat is None:
             return None
 
-        # --- Continuity: keep t_hat direction consistent across time ---
+        # keep t_hat direction consistent
         if self.prev_t_hat is not None and float(np.dot(t_hat, self.prev_t_hat)) < 0.0:
-            t_hat = -t_hat  # flip tangent to maintain continuity
+            t_hat = -t_hat
 
-        # --- Choose a stable reference axis for building e1 ---
-        # Use previous e1 if available; otherwise pick a world axis not parallel to t_hat
+        # build a stable e1
+        e1 = None
         if self.prev_e1 is not None:
-            # make e1 the previous e1 projected onto the plane normal to t_hat
             e1 = self.prev_e1 - np.dot(self.prev_e1, t_hat) * t_hat
             e1 = self._unit(e1)
             if e1 is None:
-                self.prev_e1 = None  # fallback below
-        else:
-            e1 = None
+                self.prev_e1 = None
 
         if e1 is None:
-            print("Fallback")
-            # fallback: pick a world axis that is least aligned with t_hat
             cand_axes = [
                 np.array([1.0, 0.0, 0.0], dtype=float),
                 np.array([0.0, 1.0, 0.0], dtype=float),
                 np.array([0.0, 0.0, 1.0], dtype=float),
             ]
             dots = [abs(float(np.dot(a, t_hat))) for a in cand_axes]
-            ref = cand_axes[int(np.argmin(dots))]  # least aligned axis
+            ref = cand_axes[int(np.argmin(dots))]
             e1 = self._unit(np.cross(t_hat, ref))
             if e1 is None:
                 return None
 
         e2 = np.cross(t_hat, e1)
 
-        # --- Continuity: prevent e1 from flipping sign (keeps theta stable) ---
+        # prevent e1 sign flips
         if self.prev_e1 is not None and float(np.dot(e1, self.prev_e1)) < 0.0:
             e1 = -e1
             e2 = -e2
 
-        # store for next step
         self.prev_t_hat = t_hat
         self.prev_e1 = e1
-
         return p_tip, t_hat, e1, e2
-
 
     def _parse_contact_item(self, item):
         id1 = id2 = None
         p1 = p2 = None
-
         if isinstance(item, (list, tuple)) and len(item) >= 4:
             try: id1 = int(item[0])
             except Exception: id1 = None
@@ -137,42 +114,27 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             except Exception: id1 = None
             p1 = self._v3(item[1])
             p2 = self._v3(item[2])
-
         return id1, p1, id2, p2
 
-    def _tip_circumference_point(self, p_tip, t_hat, e1, e2, p_cath, p_env=None):
-        # v = p_cath - p_tip
-        v = p_cath - p_env
-        print(f"distance: {np.linalg.norm(v)}")
+    def _r_perp_to_axis(self, p, p_tip, t_hat):
+        w = p - p_tip
+        w_perp = w - np.dot(w, t_hat) * t_hat
+        return float(np.linalg.norm(w_perp))
+
+    def _theta_from_env(self, p_tip, t_hat, e1, e2, p_env):
+        # direction from centerline tip toward vessel point
+        v = p_env - p_tip
         v_perp = v - np.dot(v, t_hat) * t_hat
         n = float(np.linalg.norm(v_perp))
-        d = p_cath - p_env
-        # print(f"distance p2 {np.linalg.norm(d)}")
-        # fallback if nearly axial: use env->cath direction
-        if n < self.r_perp_min and (p_env is not None):
-            d = p_cath - p_env
-            print(f"distance p2 {np.linalg.norm(d)}")
-            d_perp = d - np.dot(d, t_hat) * t_hat
-            n2 = float(np.linalg.norm(d_perp))
-            if n2 >= self.r_perp_min:
-                v_perp = d_perp
-                n = n2
-
         if n < 1e-12:
-            return None, None, None
-
+            return None
         r_hat = v_perp / n
-
-
-
-        p_circ = p_tip + self.R * r_hat
         c1 = float(np.dot(r_hat, e1))
         c2 = float(np.dot(r_hat, e2))
         theta = float(np.arctan2(c2, c1))
         if theta < 0:
             theta += 2.0*np.pi
-        return p_circ, r_hat, theta
-
+        return theta
 
     def onAnimateEndEvent(self, event):
         self.step += 1
@@ -182,298 +144,76 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         t = float(self.getContext().time.value)
 
         if not self._csv_initialized:
+            out_dir = os.path.dirname(self.csv_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
             with open(self.csv_path, "w") as f:
-                f.write("t,has_contact,theta_wrapped,theta_unwrapped,gap,d_cath\n")
+                # one row per contact per step
+                f.write("t,contact_index,id1,id2,d_tip,gap_surf,theta\n")
             self._csv_initialized = True
 
-        # Defaults: no contact (or unusable contact)
-        has_contact = 0
-        gap = np.nan
-        theta = np.nan
-        theta_unwrapped = np.nan
-        d_cath = np.nan
+        # If no contacts at all, optionally write nothing (or write a sentinel row)
+        if self.cl is None or self.collision_mo is None:
+            return
 
-        # ---- Try compute contact; NEVER return early ----
-        try:
-            if self.cl is None or self.collision_mo is None:
-                raise RuntimeError("missing objects")
+        nC = int(self.cl.getNumberOfContacts())
+        if nC <= 0:
+            return
 
-            nC = int(self.cl.getNumberOfContacts())
-            if nC <= 0:
-                raise RuntimeError("no contacts")
+        pos = np.asarray(self.collision_mo.position.value, dtype=float)
+        frame = self._compute_tip_frame(pos)
+        if frame is None:
+            return
+        p_tip, t_hat, e1, e2 = frame
 
-            pos = np.asarray(self.collision_mo.position.value, dtype=float)
-            frame = self._compute_tip_frame(pos)
-            if frame is None:
-                raise RuntimeError("no frame")
-            p_tip, t_hat, e1, e2 = frame
+        cps = self.cl.getContactPoints()
+        if cps is None or len(cps) == 0:
+            return
 
-            dists = np.asarray(self.cl.getDistances(), dtype=float).ravel()
-            cps = self.cl.getContactPoints()
-            if cps is None or len(cps) == 0:
-                raise RuntimeError("no cps")
+        rows = []
+        for j, item in enumerate(cps):
+            id1, p1, id2, p2 = self._parse_contact_item(item)
+            if p1 is None or p2 is None:
+                continue
 
+            # Tip locality based on closeness to p_tip
+            d1_tip = float(np.linalg.norm(p1 - p_tip))
+            d2_tip = float(np.linalg.norm(p2 - p_tip))
+            d_tip = min(d1_tip, d2_tip)
+            if d_tip > self.tip_window:
+                continue
 
-            # if best_idx is None:
-            #     raise RuntimeError("no tip-local contacts")
-            # gap = best_gap
-
-            # idx = 0
-            # if dists is not None and dists.size == len(cps) and np.any(np.isfinite(dists)):
-            #     idx = int(np.nanargmin(dists))
-            #     gap = float(dists[idx])
-
-            # Gate: treat as "no contact" but STILL log the row
-            # if np.isfinite(gap) and gap > self.gate:
-            #     raise RuntimeError("gap gated out")
-
-            # id1, p1, id2, p2 = self._parse_contact_item(cps[idx])
-            # if p1 is None or p2 is None:
-            #     raise RuntimeError("bad p1/p2")
-
-            # d1 = float(np.linalg.norm(p1 - p_tip))
-            # d2 = float(np.linalg.norm(p2 - p_tip))
-            # if d1 <= d2:
-            #     p_cath, p_env = p1, p2
-            #     d_cath = d1
-            # else:
-            #     p_cath, p_env = p2, p1
-            #     d_cath = d2
-            # Build candidate list: contacts near the tip
-            best_idx = None
-            best_gap = np.inf
-            best_d_cath = np.inf
-            best_p1 = best_p2 = None
-
-            if dists is None or dists.size != len(cps):
-                raise RuntimeError("distance/contact size mismatch")
-
-            for j, item in enumerate(cps):
-                id1, p1, id2, p2 = self._parse_contact_item(item)
-                if p1 is None or p2 is None:
-                    continue
-
-                d1 = float(np.linalg.norm(p1 - p_tip))
-                d2 = float(np.linalg.norm(p2 - p_tip))
-                d_c = min(d1, d2)
-
-                # keep only tip-near contacts
-                if d_c > self.tip_window:
-                    continue
-
-                g = float(dists[j])
-                if not np.isfinite(g):
-                    continue
-
-                if g < best_gap:
-                    best_gap = g
-                    best_idx = j
-                    best_d_cath = d_c
-                    best_p1, best_p2 = p1, p2
-
-            if best_idx is None:
-                raise RuntimeError("no tip-local contacts")
-
-            gap = float(best_gap)
-            # print(f"gap is: {gap}")
-            d_cath = float(best_d_cath)
-
-            # Gate: treat as "no contact" but still log row
-            if np.isfinite(gap) and gap > self.gate:
-                raise RuntimeError("gap gated out")
-
-            # Decide which point is on catheter (closest to tip)
-            d1 = float(np.linalg.norm(best_p1 - p_tip))
-            d2 = float(np.linalg.norm(best_p2 - p_tip))
-            if d1 <= d2:
-                # print("p_cath is p1")
-                p_cath, p_env = best_p1, best_p2
+            # Classify which is catheter-side vs environment-side.
+            # From your diagnostics: catheter-side point is near axis (small r_perp).
+            r1 = self._r_perp_to_axis(p1, p_tip, t_hat)
+            r2 = self._r_perp_to_axis(p2, p_tip, t_hat)
+            if r1 <= r2:
+                p_cath, p_env = p1, p2
             else:
-                # print("p_cath is p2")
-                p_cath, p_env = best_p2, best_p1
+                p_cath, p_env = p2, p1
 
-            p_circ, r_hat, theta = self._tip_circumference_point(
-                p_tip, t_hat, e1, e2, p_cath, p_env=p_env
-            )
+            # Surface gap estimate (since getDistances() is NaN)
+            d_center = float(np.linalg.norm(p_env - p_cath))
+            gap_surf = d_center - self.R
+
+            # Gate in terms of surface gap (mm)
+            if np.isfinite(self.gate) and gap_surf > self.gate:
+                continue
+
+            theta = self._theta_from_env(p_tip, t_hat, e1, e2, p_env)
             if theta is None:
-                raise RuntimeError("theta None")
+                continue
 
-            # Optional: choose theta vs theta+pi closest to previous
-            def _wrap_pi(a):
-                return (a + np.pi) % (2*np.pi) - np.pi
+            rows.append((t, j, id1, id2, d_tip, gap_surf, theta))
 
-            theta = float(theta)  # ensure plain python float
-
-            if self.prev_theta is not None:
-                theta_alt = (theta + np.pi) % (2*np.pi)
-                d0 = abs(_wrap_pi(theta - self.prev_theta))
-                d1 = abs(_wrap_pi(theta_alt - self.prev_theta))
-                if d1 < d0:
-                    theta = theta_alt
-
-            # Unwrap
-            if self.prev_theta is None:
-                self.theta_unwrapped = theta
-            else:
-                d = _wrap_pi(theta - self.prev_theta)
-                self.theta_unwrapped = float(self.theta_unwrapped) + float(d)
-
-            self.prev_theta = theta
-            theta_unwrapped = float(self.theta_unwrapped)
-
-            has_contact = 1
-
-        except Exception:
-            pass
-
-
-        # ---- Write one row per step; write NaNs safely ----
-        def _fmt(x):
-            # prints "nan" for NaN, otherwise numeric with reasonable precision
-            if x is None:
-                return "nan"
-            try:
-                if np.isnan(x):
-                    return "nan"
-            except Exception:
-                pass
-            return f"{float(x):.10g}"
+        if not rows:
+            return
 
         with open(self.csv_path, "a") as f:
-            f.write(
-                f"{t:.6f},{has_contact},{_fmt(theta)},{_fmt(theta_unwrapped)},{_fmt(gap)},{_fmt(d_cath)}\n"
-            )
+            for (tt, j, id1, id2, d_tip, gap_surf, theta) in rows:
+                f.write(f"{tt:.6f},{j},{id1},{id2},{d_tip:.10g},{gap_surf:.10g},{theta:.10g}\n")
 
 
-
-# import os
-# import numpy as np
-# import Sofa
-
-# class CurvatureTorsionLogger(Sofa.Core.Controller):
-#     def __init__(self, dofs_mo, every=1, csv_path="curv_tau.csv", **kwargs):
-#         super().__init__(**kwargs)
-#         self.dofs = dofs_mo
-#         self.every = int(every)
-#         self.csv_path = str(csv_path)
-#         self.step = 0
-
-#         # Create file immediately (so you can confirm path/permissions)
-#         out_dir = os.path.dirname(self.csv_path)
-#         if out_dir:
-#             os.makedirs(out_dir, exist_ok=True)
-
-#         with open(self.csv_path, "w") as f:
-#             f.write("t,s,kappa,tau\n")
-
-#         print(f"[CurvTau] logging to: {self.csv_path}")
-
-#     @staticmethod
-#     def _arc_length(P):
-#         d = np.linalg.norm(P[1:] - P[:-1], axis=1)
-#         s = np.zeros(P.shape[0], dtype=float)
-#         s[1:] = np.cumsum(d)
-#         return s
-
-#     @staticmethod
-#     def _curvature_3pt(P, eps=1e-12):
-#         N = P.shape[0]
-#         kappa = np.full(N, np.nan, dtype=float)
-#         for i in range(1, N - 1):
-#             a = P[i]   - P[i - 1]
-#             b = P[i+1] - P[i]
-#             la = np.linalg.norm(a)
-#             lb = np.linalg.norm(b)
-#             c = P[i+1] - P[i-1]
-#             lc = np.linalg.norm(c)
-#             if la < eps or lb < eps or lc < eps:
-#                 continue
-#             area2 = np.linalg.norm(np.cross(a, b))  # 2*Area
-#             if area2 < eps:
-#                 kappa[i] = 0.0
-#                 continue
-#             kappa[i] = (2.0 * area2) / (la * lb * lc)
-#         return kappa
-
-#     @staticmethod
-#     def _torsion_dihedral(P, s, eps=1e-12):
-#         N = P.shape[0]
-#         tau = np.full(N, np.nan, dtype=float)
-
-#         for i in range(1, N - 2):
-#             p0, p1, p2, p3 = P[i-1], P[i], P[i+1], P[i+2]
-#             b1 = p1 - p0
-#             b2 = p2 - p1
-#             b3 = p3 - p2
-
-#             n1 = np.cross(b1, b2)
-#             n2 = np.cross(b2, b3)
-
-#             n1n = np.linalg.norm(n1)
-#             n2n = np.linalg.norm(n2)
-#             b2n = np.linalg.norm(b2)
-#             if n1n < eps or n2n < eps or b2n < eps:
-#                 continue
-
-#             n1u = n1 / n1n
-#             n2u = n2 / n2n
-#             t2  = b2 / b2n
-
-#             x = np.dot(n1u, n2u)
-#             y = np.dot(t2, np.cross(n1u, n2u))
-#             angle = np.arctan2(y, x)
-
-#             ds = s[i+1] - s[i]
-#             if ds < eps:
-#                 continue
-
-#             tau[i+1] = angle / ds
-#         return tau
-
-#     def _get_positions(self):
-#         """
-#         Works with Rigid3d: position is [x,y,z,qx,qy,qz,qw].
-#         """
-#         raw = self.dofs.position.value
-#         print(f"Raw tip Position [-1]: {raw[-1]}")
-#         print(f"Raw tip Position [-2]: {raw[-1]}")
-#         print("--------------------------------")
-#         # raw might be list-like of size N, each element length 7
-#         try:
-#             X = np.asarray(raw, dtype=float)
-#         except Exception:
-#             # fallback: build manually
-#             X = np.array([list(r) for r in raw], dtype=float)
-
-#         if X.ndim != 2 or X.shape[1] < 3:
-#             return None
-#         return X[:, :3]
-#     @staticmethod
-#     def _arc_length(P):
-#         d = np.linalg.norm(P[1:] - P[:-1], axis=1)
-#         s = np.zeros(P.shape[0], dtype=float)
-#         s[1:] = np.cumsum(d)
-#         return s
-#     def onAnimateEndEvent(self, event):
-#         self.step += 1
-#         if self.every > 1 and (self.step % self.every != 0):
-#             return
-
-#         P = self._get_positions()
-#         if P is None or P.shape[0] < 4:
-#             return
-
-#         t = float(self.getContext().time.value)
-
-#         s = self._arc_length(P)
-#         kappa = self._curvature_3pt(P)
-#         tau = self._torsion_dihedral(P, s)
-
-#         with open(self.csv_path, "a") as f:
-#             for i in range(P.shape[0]):
-#                 kv = "nan" if np.isnan(kappa[i]) else f"{kappa[i]:.10g}"
-#                 tv = "nan" if np.isnan(tau[i])   else f"{tau[i]:.10g}"
-#                 f.write(f"{t:.6f},{s[i]:.10g},{kv},{tv}\n")
 
 class CurvatureTorsionLogger(Sofa.Core.Controller):
     def __init__(self, dofs_mo, every=1,
@@ -1036,7 +776,8 @@ def createScene(rootNode):
         collision_mo=collision_mo,
         R=catheter_radius,
         every=1,
-        gate=1e-3,
+        gate=0.5,
+      
         show_p1=True
     ))
 
