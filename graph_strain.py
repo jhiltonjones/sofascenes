@@ -14,9 +14,7 @@ plt.ylabel("tip spin (deg)")
 plt.title("Tip spin vs time")
 plt.show()
 
-# -------------------------
-# Pick a time slice: nearest time in curv_tau to latest spin time
-# -------------------------
+
 t0 = float(spin["t"][-1])
 idx = np.argmin(np.abs(curv["t"] - t0))
 t0_data = float(curv["t"][idx])

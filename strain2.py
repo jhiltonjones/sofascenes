@@ -26,9 +26,9 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         super().__init__(**kwargs)
         self.cl = contact_listener
         self.collision_mo = collision_mo
-        self.R = float(R)                 # in your scene units (mm)
+        self.R = float(R)                
         self.every = int(every)
-        self.gate = float(gate)           # gate in mm (surface gap)
+        self.gate = float(gate)    
         self.tip_window = float(tip_window)
         self.r_perp_min = float(r_perp_min)
 
@@ -776,7 +776,7 @@ def createScene(rootNode):
         collision_mo=collision_mo,
         R=catheter_radius,
         every=1,
-        gate=0.5,
+        gate=2,
       
         show_p1=True
     ))
