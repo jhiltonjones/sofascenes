@@ -601,6 +601,22 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
         x = float(np.dot(u_ref, u_now))
         y = float(np.dot(axis, np.cross(u_ref, u_now)))
         return float(np.arctan2(y, x))
+    @staticmethod
+    def active_polyline(P, eps_seg=1e-6, min_pts=6):
+        P = np.asarray(P, float)
+        if P.shape[0] < min_pts:
+            return P
+
+        d = np.linalg.norm(P[1:] - P[:-1], axis=1)
+        good = d > eps_seg
+        if not np.any(good):
+            return P[:0]  # empty
+
+        i0 = int(np.argmax(good))  # first True
+        P2 = P[i0:]
+
+        return P2 if P2.shape[0] >= min_pts else P2
+
 
     def onAnimateEndEvent(self, event):
         self.step += 1
@@ -610,44 +626,65 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
         P, Q = self._get_positions()
         if P is None or P.shape[0] < 4:
             return
+        P_col = np.asarray(self.getContext().getRoot().getChild("BeamModel")
+                        .getChild("CollisionModel").getObject("CollisionDOFs").position.value, dtype=float)
+        # if self.step %10==0:
+        #     P_dofs, _ = self._get_positions()  # your current source
+        #     P_col = np.asarray(self.getContext().getRoot().getChild("BeamModel")
+        #                     .getChild("CollisionModel").getObject("CollisionDOFs").position.value, dtype=float)
+
+        #     print("DOFs:", P_dofs.shape, "mid", P_dofs[len(P_dofs)//2], "last", P_dofs[-1])
+        #     print("COL :", P_col.shape,  "mid", P_col[len(P_col)//2],  "last", P_col[-1])
+
 
         t = float(self.getContext().time.value)
 
-        # geometric curvature/torsion (centerline)
-        s = self._arc_length(P)
-        kappa = self._curvature_3pt(P)
-        tau = self._torsion_dihedral(P, s)
+        # axis from centerline (robust)
+        t_hat = P[-1] - P[-2]
+        n = np.linalg.norm(t_hat)
+        if n < 1e-12:
+            return
+        t_hat = t_hat / n
 
-        # --- tip spin (material twist angle) ---
-        q_tip = np.asarray(Q[-1], dtype=float)  # [qx,qy,qz,qw]
-        q_tip = self._quat_fix(q_tip)
+        # tip rotation matrix from quaternion
+        q_tip = self._quat_fix(np.asarray(Q[-1], float))
         Rm = self._quat_to_R(q_tip)
 
-        # choose axis convention (TRY Z FIRST; may need X/Y depending on your model)
-        a_local = np.array([0.0, 0.0, 1.0])
-        axis = Rm @ a_local
-
-        # choose a local "stripe" direction (must not be parallel to a_local)
-        u_local = np.array([1.0, 0.0, 0.0])
+        # choose a "stripe" direction in LOCAL frame (must not be parallel to the beam's local axis)
+        # If your beam axis is local X, pick local Y as stripe. If axis is local Z, pick local X, etc.
+        u_local = np.array([0.0, 1.0, 0.0])
         u_now = Rm @ u_local
+
+        # project onto cross-section plane
+        u_now = u_now - np.dot(u_now, t_hat) * t_hat
+        nu = np.linalg.norm(u_now)
+        if nu < 1e-12:
+            return
+        u_now /= nu
 
         if self.u_ref is None:
             self.u_ref = u_now
             self.phi_unwrapped = 0.0
         else:
-            dphi = self._signed_angle_about_axis(self.u_ref, u_now, axis)
+            dphi = self._signed_angle_about_axis(self.u_ref, u_now, t_hat)
             if dphi is not None:
-                self.phi_unwrapped += float(dphi)
+                self.phi_unwrapped += dphi
                 self.u_ref = u_now
+        P_use = self.active_polyline(P_col, eps_seg=1e-4)  # tune eps to your mm scale
+        if P_use is None or P_use.shape[0] < 4:
+            return
 
-        # wrapped version in [0, 2pi)
+        s = self._arc_length(P_use)
+        kappa = self._curvature_3pt(P_use)
+        tau = self._torsion_dihedral(P_use, s)
+
         phi_wrapped = float(self.phi_unwrapped % (2.0*np.pi))
-
         with open(self.spin_csv_path, "a") as f:
             f.write(f"{t:.6f},{phi_wrapped:.10g},{float(self.phi_unwrapped):.10g}\n")
 
         with open(self.csv_path, "a") as f:
-            for i in range(P.shape[0]):
+            for i in range(P_use.shape[0]):
+
                 kv = "nan" if np.isnan(kappa[i]) else f"{kappa[i]:.10g}"
                 tv = "nan" if np.isnan(tau[i])   else f"{tau[i]:.10g}"
                 f.write(f"{t:.6f},{s[i]:.10g},{kv},{tv}\n")
@@ -933,7 +970,7 @@ def createScene(rootNode):
         rootNode, "CalibrationBox",
         size_x=100.0 * MM, size_y=100.0 * MM, thickness=5.0 * MM,
         translation=(0.0, 0.0, 25.0 * MM),
-        rotation=(50, 0, 90),
+        rotation=(35, 0, 180),
         collision=True,
         visual=True
     )
