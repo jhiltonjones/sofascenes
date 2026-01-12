@@ -64,11 +64,9 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         if t_hat is None:
             return None
 
-        # keep t_hat direction consistent
         if self.prev_t_hat is not None and float(np.dot(t_hat, self.prev_t_hat)) < 0.0:
             t_hat = -t_hat
 
-        # build a stable e1
         e1 = None
         if self.prev_e1 is not None:
             e1 = self.prev_e1 - np.dot(self.prev_e1, t_hat) * t_hat
@@ -90,7 +88,6 @@ class ContactTipCircLogger(Sofa.Core.Controller):
 
         e2 = np.cross(t_hat, e1)
 
-        # prevent e1 sign flips
         if self.prev_e1 is not None and float(np.dot(e1, self.prev_e1)) < 0.0:
             e1 = -e1
             e2 = -e2
@@ -122,7 +119,6 @@ class ContactTipCircLogger(Sofa.Core.Controller):
         return float(np.linalg.norm(w_perp))
 
     def _theta_from_env(self, p_tip, t_hat, e1, e2, p_env):
-        # direction from centerline tip toward vessel point
         v = p_env - p_tip
         v_perp = v - np.dot(v, t_hat) * t_hat
         n = float(np.linalg.norm(v_perp))
@@ -148,11 +144,9 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
             with open(self.csv_path, "w") as f:
-                # one row per contact per step
                 f.write("t,contact_index,id1,id2,d_tip,gap_surf,theta\n")
             self._csv_initialized = True
 
-        # If no contacts at all, optionally write nothing (or write a sentinel row)
         if self.cl is None or self.collision_mo is None:
             return
 
@@ -176,15 +170,13 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             if p1 is None or p2 is None:
                 continue
 
-            # Tip locality based on closeness to p_tip
             d1_tip = float(np.linalg.norm(p1 - p_tip))
             d2_tip = float(np.linalg.norm(p2 - p_tip))
             d_tip = min(d1_tip, d2_tip)
             if d_tip > self.tip_window:
                 continue
 
-            # Classify which is catheter-side vs environment-side.
-            # From your diagnostics: catheter-side point is near axis (small r_perp).
+
             r1 = self._r_perp_to_axis(p1, p_tip, t_hat)
             r2 = self._r_perp_to_axis(p2, p_tip, t_hat)
             if r1 <= r2:
@@ -192,11 +184,9 @@ class ContactTipCircLogger(Sofa.Core.Controller):
             else:
                 p_cath, p_env = p2, p1
 
-            # Surface gap estimate (since getDistances() is NaN)
             d_center = float(np.linalg.norm(p_env - p_cath))
             gap_surf = d_center - self.R
 
-            # Gate in terms of surface gap (mm)
             if np.isfinite(self.gate) and gap_surf > self.gate:
                 continue
 
@@ -231,7 +221,6 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
         self.u_ref = None
         self.phi_unwrapped = None
 
-        # init files
         out_dir = os.path.dirname(self.csv_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -256,7 +245,7 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
             lc = np.linalg.norm(c)
             if la < eps or lb < eps or lc < eps:
                 continue
-            area2 = np.linalg.norm(np.cross(a, b))  # 2*Area
+            area2 = np.linalg.norm(np.cross(a, b))  
             if area2 < eps:
                 kappa[i] = 0.0
                 continue
@@ -318,14 +307,12 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
             return None, None
         return X[:, :3], X[:, 3:7]
     def _quat_fix(self, q):
-        # enforce q continuity (q and -q are the same rotation)
         if getattr(self, "prev_q", None) is not None and float(np.dot(q, self.prev_q)) < 0.0:
             q = -q
         self.prev_q = q
         return q
 
     def _quat_to_R(self, q):
-        # q = [qx,qy,qz,qw]
         x, y, z, w = [float(v) for v in q]
         xx, yy, zz = x*x, y*y, z*z
         xy, xz, yz = x*y, x*z, y*z
@@ -356,9 +343,9 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
         d = np.linalg.norm(P[1:] - P[:-1], axis=1)
         good = d > eps_seg
         if not np.any(good):
-            return P[:0]  # empty
+            return P[:0]  
 
-        i0 = int(np.argmax(good))  # first True
+        i0 = int(np.argmax(good)) 
         P2 = P[i0:]
 
         return P2 if P2.shape[0] >= min_pts else P2
@@ -385,23 +372,19 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
 
         t = float(self.getContext().time.value)
 
-        # axis from centerline (robust)
         t_hat = P[-1] - P[-2]
         n = np.linalg.norm(t_hat)
         if n < 1e-12:
             return
         t_hat = t_hat / n
 
-        # tip rotation matrix from quaternion
         q_tip = self._quat_fix(np.asarray(Q[-1], float))
         Rm = self._quat_to_R(q_tip)
 
-        # choose a "stripe" direction in LOCAL frame (must not be parallel to the beam's local axis)
-        # If your beam axis is local X, pick local Y as stripe. If axis is local Z, pick local X, etc.
+
         u_local = np.array([0.0, 1.0, 0.0])
         u_now = Rm @ u_local
 
-        # project onto cross-section plane
         u_now = u_now - np.dot(u_now, t_hat) * t_hat
         nu = np.linalg.norm(u_now)
         if nu < 1e-12:
@@ -416,7 +399,7 @@ class CurvatureTorsionLogger(Sofa.Core.Controller):
             if dphi is not None:
                 self.phi_unwrapped += dphi
                 self.u_ref = u_now
-        P_use = self.active_polyline(P_col, eps_seg=1e-4)  # tune eps to your mm scale
+        P_use = self.active_polyline(P_col, eps_seg=1e-4) 
         if P_use is None or P_use.shape[0] < 4:
             return
 
@@ -447,7 +430,6 @@ def add_static_box_rigid(parent, name,
                          visual=True):
     root = parent.addChild(name)
 
-    # Rigid DOF for pose
     root.addObject('MechanicalObject', name='rigidDOF', template='Rigid3d',
                    position=[[translation[0], translation[1], translation[2], 0, 0, 0, 1]],
                    rotation=list(rotation),
@@ -465,17 +447,11 @@ def add_static_box_rigid(parent, name,
     ]
 
     triangles = [
-        # bottom
         [0, 2, 1], [0, 3, 2],
-        # top
         [4, 5, 6], [4, 6, 7],
-        # -y
         [0, 1, 5], [0, 5, 4],
-        # +y
         [3, 7, 6], [3, 6, 2],
-        # -x
         [0, 4, 7], [0, 7, 3],
-        # +x
         [1, 2, 6], [1, 6, 5],
     ]
 
@@ -506,37 +482,28 @@ def add_static_mesh(parent, name, filename,
     """
     n = parent.addChild(name)
 
-    # Pick loader based on extension
     ext = filename.split('.')[-1].lower()
     if ext == "stl":
         n.addObject('MeshSTLLoader', name='loader', filename=filename,
                     flipNormals=flipNormals, triangulate=triangulate, rotation=list(rotation))
-        # STL loader output typically provides position + triangles
         n.addObject('MeshTopology', name='topo',
                     position='@loader.position',
                     triangles='@loader.triangles')
     elif ext == "obj":
-        # MeshOBJLoader provides position + triangles/quads/edges depending on file
         n.addObject('MeshOBJLoader', name='loader', filename=filename,
                     flipNormals=flipNormals, triangulate=triangulate, rotation=list(rotation))
         n.addObject('MeshTopology', name='topo',
                     position='@loader.position',
                     triangles='@loader.triangles')
-        # Note: if your OBJ has quads only, triangulate=True is important.
     else:
         raise ValueError(f"Unsupported mesh extension: {ext}")
 
-    # Mechanical state (even for static objects)
     n.addObject('MechanicalObject', name='dofs',
                 translation=list(translation), rotation=list(rotation), scale=scale,
                 showObject=False, showObjectScale=1.0)
 
-    # IMPORTANT: ensure topology follows the MechanicalObject transform
-    # In many scenes this is implicit; if you see transform not applied, add a mapping:
-    # n.addObject('IdentityMapping', input='@dofs', output='@topo')  # only if needed
 
     if collision:
-        # Static collision object
         n.addObject('TriangleCollisionModel', name='triColl',
                     moving=False, simulated=False)
         n.addObject('LineCollisionModel', name='lineColl',
@@ -548,17 +515,71 @@ def add_static_mesh(parent, name, filename,
         visu = n.addChild('Visual')
         visu.addObject('OglModel', name='ogl', src='@../loader', color=[1.0, 1.0, 1.0, 0.2])
 
-        visu.addObject('IdentityMapping')  # maps MechanicalObject to OglModel
+        visu.addObject('IdentityMapping')  
 
     return n
 
+import Sofa
+import numpy as np
+
+class TubeStripeBuilder(Sofa.Core.Controller):
+
+    def __init__(self, quads_mo, stripe_topo,
+                 nbPointsOnEachCircle=12,
+                 stripe_index=0,
+                 stripe_width=1,
+                 rebuild_if_pointcount_changes=True,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.quads_mo = quads_mo              
+        self.stripe_topo = stripe_topo       
+        self.N = int(nbPointsOnEachCircle)
+        self.i0 = int(stripe_index)
+        self.w = int(stripe_width)
+        self.rebuild_if_pointcount_changes = bool(rebuild_if_pointcount_changes)
+
+        self._built = False
+        self._last_npts = None
+
+    def _build(self):
+        npts = len(self.quads_mo.position.value)
+        if npts is None or npts <= 0 or self.N <= 2:
+            return False
+
+        nrings = npts // self.N
+        if nrings < 2:
+            return False
+
+        quads = []
+        for k in range(nrings - 1):
+            for off in range(self.w):
+                i = (self.i0 + off) % self.N
+                ip = (i + 1) % self.N
+
+                a = k * self.N + i
+                b = k * self.N + ip
+                c = (k + 1) * self.N + ip
+                d = (k + 1) * self.N + i
+                quads.append([a, b, c, d])
+
+        self.stripe_topo.findData("quads").value = quads
+
+        self._built = True
+        self._last_npts = npts
+        return True
+
+    def onAnimateEndEvent(self, event):
+        npts = len(self.quads_mo.position.value)
+        if not self._built:
+            self._build()
+        elif self.rebuild_if_pointcount_changes and self._last_npts is not None and npts != self._last_npts:
+            self._build()
 
 def createScene(rootNode):
 
     rootNode.addObject('RequiredPlugin', name="plug1", pluginName='BeamAdapter Sofa.Component.Constraint.Projective Sofa.Component.LinearSolver.Direct Sofa.Component.ODESolver.Backward Sofa.Component.StateContainer Sofa.Component.Topology.Container.Constant Sofa.Component.Topology.Container.Grid Sofa.Component.Visual Sofa.Component.SolidMechanics.Spring Sofa.Component.Topology.Container.Dynamic')
     rootNode.addObject('RequiredPlugin', name="plug2", pluginName='Sofa.Component.AnimationLoop Sofa.Component.Collision.Detection.Algorithm Sofa.Component.Collision.Detection.Intersection Sofa.Component.Collision.Geometry Sofa.Component.Collision.Response.Contact Sofa.Component.Constraint.Lagrangian.Correction Sofa.Component.Constraint.Lagrangian.Solver Sofa.Component.IO.Mesh')
     rootNode.addObject('RequiredPlugin', pluginName='Sofa.Component.Topology.Mapping Sofa.Component.Mapping.Linear Sofa.GL.Component.Rendering3D')
-    # rootNode.dt = 0.005   # 5 ms
     rootNode.addObject("VisualStyle", displayFlags="showVisualModels hideBehaviorModels showCollisionModels")
 
 
@@ -575,15 +596,13 @@ def createScene(rootNode):
                        computeConstraintForces=True)
 
 
-    # MM = 1e-3  # millimeter in meters
+    # MM = 1e-3  
     MM = 1
-    # --- Catheter material (SI) ---
-    catheter_radius = 2.0 * MM          # 2 mm -> 0.002 m
-    catheter_E   = 2.0e6              # 2e9 Pa -> 2e6 kg/(mm*s^2)
-    catheter_rho = 1.1e-6             # 1100 kg/m^3 -> 1.1e-6 kg/mm^3
+    catheter_radius = 2.0
+    catheter_length = 980.0
+    catheter_E = 2.4e3          # kg/(mm s^2)
+    catheter_rho = 1.1e-6     # kg/mm^3
 
-    # --- Catheter geometry (SI) ---
-    catheter_length = 980.0 * MM        # 980 mm -> 0.98 m
 
 
     rootNode.addObject('CollisionPipeline', draw='0', depth='6', verbose='1')
@@ -625,7 +644,7 @@ def createScene(rootNode):
                             xmax=0.0, xmin=0.0, ymin=0, ymax=0, zmax=0, zmin=0,
                             p0=[0, 0, 0])
 
-    BeamMechanics.addObject('MechanicalObject', showIndices=False, name='DOFs', template='Rigid3d', ry=-90)
+    BeamMechanics.addObject('MechanicalObject', showIndices=False, name='DOFs', template='Rigid3d', ry=0)
     BeamMechanics.addObject('WireBeamInterpolation', name='BeamInterpolation',
                             WireRestShape='@../EdgeTopology/BeamRestShape', printLog=False)
 
@@ -652,8 +671,8 @@ def createScene(rootNode):
         xtip=[0],
         printLog=True,
         rotationInstrument=0,
-        step  = 1.0 * MM,      # 1 mm
-        speed = 20.0 * MM,      # 2 mm/s        
+        step  = 1.0 * MM,    
+        speed = 20.0 * MM,          
         listening=True,
         controlledInstrument=0
     )
@@ -677,11 +696,9 @@ def createScene(rootNode):
 
 
 
-    # --- References needed by the simplified logger ---
     gcs = rootNode.getObject('GCS')
     collision_mo = BeamCollis.getObject('CollisionDOFs')
 
-    # --- Visual catheter (unchanged) ---
     VisuCath = BeamMechanics.addChild('VisuCatheter')
     VisuCath.addObject('MechanicalObject', name="Quads", template="Vec3d")
     VisuCath.addObject('QuadSetTopologyContainer', name="TubeQuads")
@@ -712,11 +729,24 @@ def createScene(rootNode):
     VisuOgl.addObject('OglModel', name="CatheterVisual", src='@../TubeQuads', color='white')
     VisuOgl.addObject('IdentityMapping', input='@../Quads', output='@CatheterVisual')
 
+    Stripe = VisuCath.addChild("Stripe")
+    Stripe.addObject("QuadSetTopologyContainer", name="StripeTopo", quads=[])
+    Stripe.addObject("OglModel", name="StripeVisual", src="@StripeTopo", color=[1.0, 0.0, 0.0, 1.0])
+    Stripe.addObject("IdentityMapping", input="@../Quads", output="@StripeVisual")
+
+    Stripe.addObject(TubeStripeBuilder(
+        quads_mo=VisuCath.getObject("Quads"),
+        stripe_topo=Stripe.getObject("StripeTopo"),
+        nbPointsOnEachCircle=12,   
+        stripe_index=0,           
+        stripe_width=1             
+    ))
+
     # box = add_static_box_rigid(
     #     rootNode, "CalibrationBox",
     #     size_x=100.0 * MM, size_y=100.0 * MM, thickness=5.0 * MM,
     #     translation=(0.0, 0.0, 25.0 * MM),
-    #     rotation=(50, 0, 0),
+    #     rotation=(0, 90, 50),
     #     collision=True,
     #     visual=True
     # )
@@ -726,18 +756,25 @@ def createScene(rootNode):
     carotids = add_static_mesh(
         rootNode, "Carotids",
         carotids_path,
-        translation=(-1*MM, 4, 0),
-        rotation=(30, -90, 90),
+        translation=(-8*MM, 5, 0),
+
+        rotation=(270, 0, -70),
         scale=3.0*MM,
         visual=True,
         collision=True,     
         triangulate=True
     )
     vessel_tris = carotids.getObject('triColl')
+    #     # translation=(15*MM, 5, 0),
+    #     # rotation=(270, 4, -90),
+    
+
+
+        # translation=(-8*MM, 5, 0),
+
+        # rotation=(270, 0, -70),
+
     cath_points = BeamCollis.getObject('cathPoints')
-
-
-    # cath_points = BeamCollis.getObject('cathPoints')
     cm1 = '@' + cath_points.getPathName()
 
 
@@ -751,24 +788,6 @@ def createScene(rootNode):
         listening=True
     )
 
-
-    # # --- Replace old logger with the simplified one ---
-    # BeamCollis.addObject(TipForceVsGeometryAngle(
-    #     collision_mo=collision_mo,
-    #     constraint_solver=gcs,
-    #     contact_listener=contact_listener,
-    #     k=1,               # last 1 collision point (your previous setting)
-    #     sample_every=1
-    # ))
-    # BeamCollis.addObject(PrintTipPos(collision_mo=collision_mo, every=20))
-    # BeamCollis.addObject(TipContactForceAndPointRobust(
-    #     collision_mo=collision_mo,
-    #     constraint_solver=gcs,
-    #     contact_listener=contact_listener,
-    #     tip_radius=catheter_radius,  # IMPORTANT
-    #     tip_window=1,
-    #     sample_every=1
-    # ))
 
 
     BeamCollis.addObject(ContactTipCircLogger(
